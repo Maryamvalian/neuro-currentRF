@@ -1230,7 +1230,7 @@ class NCRF:
             self._data = data
 
         return data
-    
+            
     def _construct_f(self, data: RegressionData) -> tuple[ObjectiveFunction, GradientFunction]:
         """Build the smooth objective and gradient passed to FASTA.
 
