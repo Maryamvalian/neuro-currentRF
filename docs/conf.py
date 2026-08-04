@@ -7,6 +7,7 @@ from datetime import date
 
 import eelbrain
 from intersphinx_registry import get_intersphinx_mapping
+from sphinx_gallery.sorting import FileNameSortKey
 
 import ncrf
 
@@ -29,29 +30,27 @@ extensions = [
     "sphinx.ext.intersphinx",
     "sphinx.ext.autosummary",
     "sphinx.ext.mathjax",
+    "sphinx.ext.napoleon",
     'sphinx_gallery.gen_gallery',
     "sphinxcontrib.bibtex",
-    "numpydoc",
     "sphinx.ext.githubpages",  # .nojekyll file on generated HTML directory to publish the document on GitHub Pages. 
 ]
 
-templates_path = ['_templates']
-exclude_patterns = ['_build', 'Thumbs.db', '.DS_Store']
-
-templates_path = ["_templates"]
+templates_path = ["templates"]
 exclude_patterns = ["_build", "Thumbs.db", ".DS_Store", "**.ipynb_checkpoints"]
 
 # Sphinx will warn about all references where the target cannot be found.
 nitpicky = True
-nitpick_ignore = [("py:obj", "optional"), ("py:obj", "NCRF")]
+nitpick_ignore = [
+    ("py:obj", "optional"),
+    ("py:obj", "NCRF"),
+    # NumPy's intersphinx inventory resolves ndarray/dtype, but not this scalar
+    # class when Sphinx expands npt.NDArray[np.float64] in dataclass signatures.
+    ("py:class", "numpy.float64"),
+]
 
 # A list of ignored prefixes for module index sorting.
 modindex_common_prefix = [f"{package}."]
-
-# The name of a reST role (builtin or Sphinx extension) to use as the default role, that
-# is, for text marked up `like this`. This can be set to 'py:obj' to make `filter` a
-# cross-reference to the Python function “filter”.
-default_role = "autolink"
 
 # list of warning types to suppress
 suppress_warnings = [
@@ -78,6 +77,21 @@ autodoc_member_order = "groupwise"
 autodoc_warningiserror = True
 autoclass_content = "class"
 
+# -- napoleon --------------------------------------------------------------------------
+napoleon_google_docstring = False
+napoleon_include_init_with_doc = True
+napoleon_include_special_with_doc = False
+napoleon_use_param = True
+napoleon_use_ivar = False
+napoleon_use_keyword = True
+napoleon_use_rtype = True
+
+qualname_overrides = {
+    "ncrf._model.NCRF": "ncrf.NCRF",
+    "ncrf._model.RegressionData": "ncrf.RegressionData",
+    "ncrf._ncrf.fit_ncrf": "ncrf.fit_ncrf",
+}
+
 # -- intersphinx -----------------------------------------------------------------------
 intersphinx_mapping = get_intersphinx_mapping(
     packages={
@@ -97,30 +111,6 @@ intersphinx_mapping.update({
 })
 intersphinx_timeout = 5
 
-# x-ref
-numpydoc_xref_param_type = True
-numpydoc_xref_aliases = {
-    # Matplotlib
-    "Axes": "matplotlib.axes.Axes",
-    "Figure": "matplotlib.figure.Figure",
-    # MNE
-    "DigMontage": "mne.channels.DigMontage",
-    "Epochs": "mne.Epochs",
-    "Evoked": "mne.Evoked",
-    "Info": "mne.Info",
-    "Projection": "mne.Projection",
-    "Raw": "mne.io.Raw",
-    # Python
-    "bool": ":class:`python:bool`",
-    "Path": "pathlib.Path",
-    "TextIO": "io.TextIOBase",
-    # Eelbrain
-    "NDVar": "eelbrain.NDVar",
-    "case": "eelbrain.Case",
-    "sensor": "eelbrain.Sensor",
-    "time": "eelbrain.UTS"
-}
-
 # -- sphinx-gallery
 
 def use_pyplot(gallery_conf, fname):
@@ -131,6 +121,7 @@ sphinx_gallery_conf = {
     'filename_pattern': '/',
     'gallery_dirs': 'auto_examples',  # path to where to save gallery generated output
     'reset_modules': ('matplotlib', use_pyplot),
+    "within_subsection_order": FileNameSortKey,
 }
 
 
