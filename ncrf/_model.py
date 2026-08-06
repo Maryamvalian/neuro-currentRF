@@ -1143,94 +1143,152 @@ class NCRF:
         self.tstop = data.tstop
         self.basis_std = data.basis_std
 
-    def reduce_data(self):
-        """
-        Reduce the model size for storage.
-
-        This method removes the cached training data stored in 'self._data' to reduce
-        the size of the model when saving to disk (for example with pickle).
-        A small amount of metadata needed for later reconstruction is stored in
-        'self._reducemeta' including meg_shape and nlevel.
-        """
+    def reduce_data(self) -> None:
+        """Remove cached fitting data to reduce the model size."""
         if self._data is None:
-            raise RuntimeError("Model is already reduced (self._data is None).")
+            raise RuntimeError("Model data have already been removed.")
 
-        self._reducemeta = {}
-        meglen = len(self._data.meg)
-        meg_shapes = []
-        for i in range(meglen):
-            meg_i = self._data.meg[i]
-            meg_shapes.append(tuple(meg_i.shape))
+        data = self._data
 
-        self._reducemeta["meg_shapes"] = meg_shapes
-        self._reducemeta["nlevel"] = self._data.nlevel
+        # Recover the nlevel used for each predictor.
+        nlevels = []
+        for basis, tstart, tstop in zip(
+                data.basis,
+                data.tstart,
+                data.tstop,
+        ):
+            start_sample = round(tstart / data.tstep)
+            stop_sample = round(tstop / data.tstep)
+
+            lag_range = stop_sample - start_sample
+            n_atoms = basis.shape[1] + 1
+            nlevel = round(lag_range / n_atoms)
+
+            nlevels.append(nlevel)
+
+        if len(set(nlevels)) != 1:
+            raise RuntimeError("All predictors should use a same nlevel.")
+
+        # Determine the number of features in each predictor.
+        stim_lengths = []
+        for dim in data.stim_dims:
+            if dim is None:
+                stim_lengths.append(1)
+            else:
+                stim_lengths.append(len(dim))
+
+        post_normalize = False
+
+        # Post-normalization is meaningful for multiple predictor features.
+        if sum(stim_lengths) > 1:
+            basis_lengths = [basis.shape[1] for basis in data.basis]
+            block_lengths = np.repeat(basis_lengths, stim_lengths)
+
+            original_norms = np.asarray(data.stim_normalization)
+            average_norms = original_norms.mean(axis=0)
+
+            current_norms = []
+            for covariates in data.covariates:
+                start = 0
+                segment_norms = []
+
+                for block_length in block_lengths:
+                    stop = start + block_length
+                    block = covariates[:, start:stop]
+                    segment_norms.append(linalg.norm(block, 2))
+                    start = stop
+
+                current_norms.append(segment_norms)
+
+            current_norms = np.asarray(current_norms)
+
+            error_without_normalization = np.abs(
+                current_norms - original_norms
+            ).sum()
+
+            error_with_normalization = np.abs(
+                current_norms - original_norms / average_norms
+            ).sum()
+
+            post_normalize = (error_with_normalization < error_without_normalization)
+
+        self._reducemeta = {
+            "meg_shapes": [meg.shape for meg in data.meg],
+            "nlevel": nlevels[0],
+            "post_normalize": post_normalize,
+            "is_whitened": data.is_whitened,
+        }
 
         self._data = None
 
     def reconstruct_data(
             self,
-            meg: Sequence[object],
-            stim: Sequence[object],
+            meg: Sequence[object] | NDVar,
+            stim: Sequence[object] | NDVar,
             attach: bool = False,
-    ):
-        """
-        Reconstruct RegressionData
-        meg : sequence of meg same as the one used for fitting
-        stim : sequence of stim same as the one used for fitting
-        attach=True : reconstructed data will be added to model._data
+    ) -> RegressionData:
+        """Reconstruct RegressionData from the original inputs."""
+        if self._reducemeta is None:
+            raise RuntimeError("Call reduce_data() first.")
 
-        Returns data : RegressionData
+        def split_cases(x: NDVar) -> list[NDVar]:
+            if x.has_dim("case"):
+                return [x.sub(case=i) for i in range(len(x.get_dim("case")))]
+            return [x]
 
-        """
-        if len(meg) != len(stim):
-            raise ValueError("Meg size and stim size do not match.")
+        meg_segments = split_cases(meg) if isinstance(meg, NDVar) else list(meg)
 
-        data = RegressionData(
+        if self._stim_is_single:
+            items = split_cases(stim) if isinstance(stim, NDVar) else list(stim)
+            stim_segments = [[item] for item in items]
+        else:
+            predictors = list(stim)
+            if all(isinstance(x, NDVar) for x in predictors):
+                if all(x.has_dim("case") for x in predictors):
+                    stim_segments = [
+                        [x.sub(case=i) for x in predictors]
+                        for i in range(len(predictors[0].get_dim("case")))
+                    ]
+                else:
+                    stim_segments = [predictors]
+            else:
+                stim_segments = [list(segment) for segment in predictors]
+
+        if len(meg_segments) != len(stim_segments):
+            raise ValueError("MEG and stimulus segment counts do not match.")
+
+        data = RegressionData.from_data(
+            meg=meg_segments,
+            stim=stim_segments,
             tstart=self.tstart,
             tstop=self.tstop,
             nlevel=self._reducemeta["nlevel"],
             baseline=self._stim_baseline,
             scaling=self._stim_scaling,
             stim_is_single=self._stim_is_single,
-            gaussian_fwhm=self.gaussian_fwhm,
+            basis_std=self.basis_std,
+            post_normalize=self._reducemeta["post_normalize"],
         )
 
-        for meg_i, stim_i in zip(meg, stim):
-            meg_i = meg_i.copy()
-            if isinstance(stim_i, (list, tuple)):
-                stim_i = [s.copy() for s in stim_i]
-            else:
-                stim_i = stim_i.copy()
-            data.add_data(meg_i, stim_i)
+        if self._reducemeta["is_whitened"]:
+            data = data.whiten(self._whitening_filter)
 
-        data.post_normalization()
-        data._prewhiten(self._whitening_filter)
-        data._precompute()
+        if [meg.shape for meg in data.meg] != self._reducemeta["meg_shapes"]:
+            raise ValueError("Reconstructed MEG shapes do not match.")
 
-        # Validate meg size and shapes
-        expected_shapes = self._reducemeta["meg_shapes"]
-        expected_meglen = len(expected_shapes)
-
-        if len(data.meg) != expected_meglen:
-            raise ValueError(" Input MEG List-size mismatches with metadata.")
-
-        for i, meg_proc in enumerate(data.meg):
-            got = tuple(meg_proc.shape)
-            exp = tuple(expected_shapes[i])
-            if got != exp:
-                raise ValueError("MEG shape (channel count or timepoints) mismatches with metadata.")
-
-        # Validate explained variance
-        ev_orig = float(self.explained_var)
-        ev_recon = float(self.compute_explained_variance(data))
-        if not np.allclose(ev_recon, ev_orig, rtol=1e-10, atol=1e-8):
-            raise ValueError("Explained variance mismatch! ")
+        if not np.allclose(
+                self.compute_explained_variance(data),
+                self.explained_var,
+                rtol=1e-10,
+                atol=1e-8,
+        ):
+            raise ValueError("Reconstructed explained variance does not match.")
 
         if attach:
             self._data = data
 
         return data
-            
+
     def _construct_f(self, data: RegressionData) -> tuple[ObjectiveFunction, GradientFunction]:
         """Build the smooth objective and gradient passed to FASTA.
 
