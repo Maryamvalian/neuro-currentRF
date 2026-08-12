@@ -1149,36 +1149,14 @@ class NCRF:
             raise RuntimeError("Model data have already been removed.")
 
         data = self._data
-
-        # Recover the nlevel used for each predictor.
-        nlevels = []
-        for basis, tstart, tstop in zip(
-                data.basis,
-                data.tstart,
-                data.tstop,
-        ):
-            start_sample = round(tstart / data.tstep)
-            stop_sample = round(tstop / data.tstep)
-
-            lag_range = stop_sample - start_sample
-            n_atoms = basis.shape[1] + 1
-            nlevel = round(lag_range / n_atoms)
-
-            nlevels.append(nlevel)
-
-        if len(set(nlevels)) != 1:
-            raise RuntimeError("All predictors should use a same nlevel.")
+        # All predictors use same nlevel
+        basis = data.basis[0]
+        nlevel = round((basis.shape[0] - 1) / (basis.shape[1] + 1))
 
         # Determine the number of features in each predictor.
-        stim_lengths = []
-        for dim in data.stim_dims:
-            if dim is None:
-                stim_lengths.append(1)
-            else:
-                stim_lengths.append(len(dim))
+        stim_lengths = [1 if dim is None else len(dim) for dim in data.stim_dims]
 
         post_normalize = False
-
         # Post-normalization is meaningful for multiple predictor features.
         if sum(stim_lengths) > 1:
             basis_lengths = [basis.shape[1] for basis in data.basis]
@@ -1214,7 +1192,7 @@ class NCRF:
 
         self._reducemeta = {
             "meg_shapes": [meg.shape for meg in data.meg],
-            "nlevel": nlevels[0],
+            "nlevel": nlevel,
             "post_normalize": post_normalize,
             "is_whitened": data.is_whitened,
         }
@@ -1227,7 +1205,7 @@ class NCRF:
             stim: Sequence[object] | NDVar,
             attach: bool = False,
     ) -> RegressionData:
-        """Reconstruct RegressionData from the original inputs."""
+        """Reconstruct RegressionData from the original inputs and reducemeta."""
         if self._reducemeta is None:
             raise RuntimeError("Call reduce_data() first.")
 
