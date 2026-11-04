@@ -344,17 +344,53 @@ class _ChampLassoState:
         requested per-iteration quantities into ``history``.
         """
         logger = logging.getLogger(__name__)
-        mu = float(self.solver.mu)
+        if self.solver.shared_mu:
+            mu = float(self.solver.mu)
+        else:
+            basis_counts = [basis.shape[1] for basis in data.design.basis]
+            if len(basis_counts) != 2:
+                raise ValueError("shared_mu=False requires exactly two predictors")
+            split = basis_counts[0]
+            mu_1, mu_2 = self.solver.mu
+
         self._initialize(data)
-        if mu == 0.0:
+        if self.solver.shared_mu and mu == 0.0:
             self._solve(data, self.theta, n_iterc=_N_ITERC_WARM)
 
-        if self.forward.space:
-            def g_funct(x): return g_group(x, mu)
-            def prox_g(x, t): return proxg_group(x, mu * t)
+        if self.solver.shared_mu:
+            if self.forward.space:
+                def g_funct(x):
+                    return g_group(x, mu)
+
+                def prox_g(x, t):
+                    return proxg_group(x, mu * t)
+            else:
+                def g_funct(x):
+                    return g(x, mu)
+
+                def prox_g(x, t):
+                    return shrink(x, mu * t)
+        elif self.forward.space:
+            def g_funct(x):
+                return (g_group(np.ascontiguousarray(x[:, :split]), mu_1)
+                        + g_group(np.ascontiguousarray(x[:, split:]), mu_2))
+
+            def prox_g(x, t):
+                out = np.empty_like(x)
+                out[:, :split] = proxg_group(
+                    np.ascontiguousarray(x[:, :split]), mu_1 * t)
+                out[:, split:] = proxg_group(
+                    np.ascontiguousarray(x[:, split:]), mu_2 * t)
+                return out
         else:
-            def g_funct(x): return g(x, mu)
-            def prox_g(x, t): return shrink(x, mu * t)
+            def g_funct(x):
+                return g(x[:, :split], mu_1) + g(x[:, split:], mu_2)
+
+            def prox_g(x, t):
+                out = np.empty_like(x)
+                out[:, :split] = shrink(x[:, :split], mu_1 * t)
+                out[:, split:] = shrink(x[:, split:], mu_2 * t)
+                return out
 
         theta = self.theta
         myname = current_process().name
@@ -584,6 +620,10 @@ class ChampLasso(Solver):
         Regularizer parameter. A number fits one model, a sequence selects among
         an explicit grid with cross-validation, and ``'auto'`` derives and
         cross-validates a grid from the data (default).
+    shared_mu
+        If True, use one regularization parameter for all predictors.
+        If False, use separate parameters for two predictors.
+        With shared_mu=False, mu can be 'auto' or a pair of fixed values.
     n_iter
         Number of outer iterations of the algorithm.
     n_iterc
@@ -607,6 +647,7 @@ class ChampLasso(Solver):
     """
 
     mu: MuArg = 'auto'
+    shared_mu: bool = True
     n_iter: int = 30
     n_iterc: int = 10
     n_iterf: int = 100
@@ -618,6 +659,11 @@ class ChampLasso(Solver):
         # a bare string would be iterated character by character
         if isinstance(self.store, str) or not frozenset(self.store).issubset(QUANTITIES):
             raise ValueError(f"store={self.store!r}: expected a sequence with any of {QUANTITIES}")
+        if not self.shared_mu:
+            if self.use_es:
+                raise ValueError("use_es requires shared_mu=True")
+            if self.mu != 'auto' if isinstance(self.mu, str) else len(self.mu) != 2:
+                raise ValueError("mu must be 'auto' or a pair of values")
 
     def without_history(self) -> ChampLasso:
         """Disable all per-iteration storage for cross-validation folds."""
@@ -630,7 +676,7 @@ class ChampLasso(Solver):
     ) -> tuple[ChampLasso, list[CVResult]]:
         """Resolve ``mu``, and cross-validate unless it is a fixed number."""
         candidates = self.candidates(data.forward, data)
-        if _is_number(self.mu):
+        if _is_number(self.mu) or (not self.shared_mu and not isinstance(self.mu, str)):
             return candidates[0], []
         cv_results = crossvalidate(data, candidates, cv)
         # Extend before selecting, so that the estimation-stability criterion is
@@ -661,6 +707,8 @@ class ChampLasso(Solver):
             cv_results: Sequence[CVResult],
     ) -> tuple[ChampLasso, ...]:
         """Return one additional decade when the cross-fit winner is on a grid boundary."""
+        if not self.shared_mu:
+            return ()
         logger = logging.getLogger(__name__)
         best = select_by_criterion(cv_results, 'cross-fit')
         mus = [result.solver.mu for result in cv_results]
@@ -716,9 +764,13 @@ class ChampLasso(Solver):
     ) -> tuple[ChampLasso, ...]:
         """Resolve ``mu`` into fixed solver configurations."""
         mu = self.mu
+        if not self.shared_mu and not isinstance(mu, str):
+            return (self,)
         if isinstance(mu, str):
             if mu != 'auto':
                 raise ValueError(f"{mu=}: expected a number, a sequence of numbers, or 'auto'")
+            if not self.shared_mu:
+                return self.auto_candidates_by_predictor(forward, data)
             return self.auto_candidates(forward, data)
         if _is_number(mu):
             values = (mu,)
@@ -743,8 +795,13 @@ class ChampLasso(Solver):
             verbose: bool = False,
     ) -> ChampLassoFit:
         """Estimate NCRF weights for one whitened dataset."""
-        if not _is_number(self.mu):
-            raise ValueError("ChampLasso.solve() requires a fixed numeric mu; use NCRFEstimator.fit() to resolve a grid or mu='auto'")
+        if self.shared_mu:
+            valid = _is_number(self.mu)
+        else:
+            valid = isinstance(self.mu, (tuple, list)) and len(self.mu) == 2
+
+        if not valid:
+            raise ValueError("ChampLasso.solve() requires fixed numeric mu values")
         history = ChampLassoHistory(frozenset(self.store))
         state = _ChampLassoState(self, forward)
         state.run(data, history, verbose)
@@ -766,3 +823,32 @@ class ChampLasso(Solver):
         hi = log10(np.percentile(gradient, 99.0))
         mus = np.logspace(hi - 2, hi, 7)
         return tuple(replace(self, mu=float(mu)) for mu in mus)
+
+    def auto_candidates_by_predictor(
+            self,
+            forward: ForwardModel,
+            data: RegressionData,
+    ) -> tuple[ChampLasso, ...]:
+        """Derive a 7 x 7 automatic mu grid for two predictors."""
+        basis_counts = [basis.shape[1] for basis in data.design.basis]
+        if len(basis_counts) != 2:
+            raise ValueError("shared_mu=False requires exactly two predictors")
+
+        state = _ChampLassoState(self, forward)
+        gradient = state.gradient(data)
+        split = basis_counts[0]
+
+        gradient_1 = gradient[:, :split]
+        gradient_2 = gradient[:, split:]
+
+        hi_1 = log10(np.percentile(gradient_1, 99.0))
+        hi_2 = log10(np.percentile(gradient_2, 99.0))
+
+        mus_1 = np.logspace(hi_1 - 2, hi_1, 7)
+        mus_2 = np.logspace(hi_2 - 2, hi_2, 7)
+
+        return tuple(
+            replace(self, mu=(float(mu_1), float(mu_2)))
+            for mu_1 in mus_1
+            for mu_2 in mus_2
+        )
