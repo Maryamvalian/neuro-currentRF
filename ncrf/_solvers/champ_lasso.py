@@ -706,24 +706,80 @@ class ChampLasso(Solver):
             self,
             cv_results: Sequence[CVResult],
     ) -> tuple[ChampLasso, ...]:
-        """Return one additional decade when the cross-fit winner is on a grid boundary."""
-        if not self.shared_mu:
-            return ()
+        """Extend the mu grid when the cross-fit winner is on a boundary."""
+        if self.shared_mu:
+            logger = logging.getLogger(__name__)
+            best = select_by_criterion(cv_results, 'cross-fit')
+            mus = [result.solver.mu for result in cv_results]
+            if best.mu == min(mus):
+                if best.mu == 0.0:
+                    return ()
+                new_mus = np.logspace(np.log10(best.mu) - 1, np.log10(best.mu), 4)[:-1]
+                direction = 'left'
+            elif best.mu == max(mus):
+                new_mus = np.logspace(np.log10(best.mu), np.log10(best.mu) + 1, 4)[1:]
+                direction = 'right'
+            else:
+                return ()
+            logger.info(f'Best cross-fit mu is {best.mu}: extending range of mu towards the {direction}')
+            return tuple(replace(best, mu=float(mu)) for mu in new_mus)
+
         logger = logging.getLogger(__name__)
         best = select_by_criterion(cv_results, 'cross-fit')
-        mus = [result.solver.mu for result in cv_results]
-        if best.mu == min(mus):
-            if best.mu == 0.0:
-                return ()  # cannot extend below the unregularized fit
-            new_mus = np.logspace(np.log10(best.mu) - 1, np.log10(best.mu), 4)[:-1]
-            direction = 'left'
-        elif best.mu == max(mus):
-            new_mus = np.logspace(np.log10(best.mu), np.log10(best.mu) + 1, 4)[1:]
-            direction = 'right'
-        else:
+        best_mu_1, best_mu_2 = best.mu
+
+        mus_1 = sorted({result.solver.mu[0] for result in cv_results})
+        mus_2 = sorted({result.solver.mu[1] for result in cv_results})
+
+        def extend_axis(values, selected):
+            if selected == values[0]:
+                if selected == 0.0:
+                    return []
+                return list(np.logspace(
+                    np.log10(selected) - 1, np.log10(selected), 4
+                )[:-1])
+
+            if selected == values[-1]:
+                return list(np.logspace(
+                    np.log10(selected), np.log10(selected) + 1, 4
+                )[1:])
+
+            return []
+
+        new_mus_1 = extend_axis(mus_1, best_mu_1)
+        new_mus_2 = extend_axis(mus_2, best_mu_2)
+
+        if not new_mus_1 and not new_mus_2:
             return ()
-        logger.info(f'Best cross-fit mu is {best.mu}: extending range of mu towards the {direction}')
-        return tuple(replace(best, mu=float(mu)) for mu in new_mus)
+
+        logger.info(
+            f'Best cross-fit mu is {best.mu}: '
+            f'extending mu_1 by {len(new_mus_1)} and '
+            f'mu_2 by {len(new_mus_2)} values'
+        )
+
+        existing = {
+            result.solver.mu for result in cv_results
+        }
+
+        candidates = (
+            (float(mu_1), float(mu_2))
+            for mu_1 in sorted(mus_1 + new_mus_1)
+            for mu_2 in sorted(mus_2 + new_mus_2)
+        )
+
+        extended = tuple(
+            replace(best, mu=mu)
+            for mu in candidates
+            if mu not in existing
+        )
+
+        print(f"\nExtended grid: {len(extended)} new candidates")
+        for i, solver in enumerate(extended, 1):
+            mu_1, mu_2 = solver.mu
+            print(f"{i:2d}: mu_1={mu_1:.12e}, mu_2={mu_2:.12e}")
+
+        return extended
 
     def cv_table(self, cv_results: Sequence[CVResult]) -> fmtxt.Table:
         """Summarize cross-validation scores by ``mu``.
@@ -847,8 +903,22 @@ class ChampLasso(Solver):
         mus_1 = np.logspace(hi_1 - 2, hi_1, 7)
         mus_2 = np.logspace(hi_2 - 2, hi_2, 7)
 
+        candidates = tuple(
+            replace(self, mu=(float(mu_1), float(mu_2)))
+            for mu_1 in mus_1
+            for mu_2 in mus_2
+        )
+
+        print(f"\nInitial grid: {len(candidates)} candidates")
+        for i, solver in enumerate(candidates, 1):
+            mu_1, mu_2 = solver.mu
+            print(f"{i:2d}: mu_1={mu_1:.12e}, mu_2={mu_2:.12e}")
+
+        return candidates
+        """
         return tuple(
             replace(self, mu=(float(mu_1), float(mu_2)))
             for mu_1 in mus_1
             for mu_2 in mus_2
         )
+        """
