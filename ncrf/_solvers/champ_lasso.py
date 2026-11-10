@@ -648,6 +648,7 @@ class ChampLasso(Solver):
 
     mu: MuArg = 'auto'
     shared_mu: bool = True
+    cv_method: str = 'grid'
     n_iter: int = 30
     n_iterc: int = 10
     n_iterf: int = 100
@@ -674,13 +675,34 @@ class ChampLasso(Solver):
             data: RegressionData,
             cv: CrossValidation,
     ) -> tuple[ChampLasso, list[CVResult]]:
-        """Resolve ``mu``, and cross-validate unless it is a fixed number."""
+        if self.cv_method == 'local' and not self.shared_mu and self.mu == 'auto':
+            mu_ind, independent_results = self.independent_cv(data, cv)
+            best, local_results = self.local_grid_cv(
+                data, cv, mu_ind, n=5, log_step=1 / 6
+            )
+
+            center = next(
+                r for r in local_results
+                if np.allclose(r.solver.mu, mu_ind, rtol=1e-12, atol=0)
+            )
+
+            winner = min(
+                local_results,
+                key=lambda r: r.scores['cross_fit']
+            )
+
+            print(f"\nIndependent pair: {mu_ind}")
+            print(f"Independent pair cross_fit: {center.scores['cross_fit']:.8f}")
+            print(f"Local grid winner: {best.mu}")
+            print(f"Local grid cross_fit: {winner.scores['cross_fit']:.8f}")
+
+            return best, local_results
+
         candidates = self.candidates(data.forward, data)
         if _is_number(self.mu) or (not self.shared_mu and not isinstance(self.mu, str)):
             return candidates[0], []
+
         cv_results = crossvalidate(data, candidates, cv)
-        # Extend before selecting, so that the estimation-stability criterion is
-        # applied to the complete cross-fit search range
         extension = self._extend_grid(cv_results)
         if extension:
             cv_results.extend(crossvalidate(data, extension, cv))
@@ -879,6 +901,108 @@ class ChampLasso(Solver):
         hi = log10(np.percentile(gradient, 99.0))
         mus = np.logspace(hi - 2, hi, 7)
         return tuple(replace(self, mu=float(mu)) for mu in mus)
+
+    def independent_cv(
+            self,
+            data: RegressionData,
+            cv: CrossValidation,
+    ) -> tuple[tuple[float, float], tuple[list[CVResult], list[CVResult]]]:
+        """Select mu_1 and mu_2 using separate single-predictor CV."""
+        if self.shared_mu:
+            raise ValueError("independent_cv requires shared_mu=False")
+        if len(data.design.basis) != 2:
+            raise ValueError("independent_cv requires exactly two predictors")
+        if not data.is_whitened:
+            raise ValueError("independent_cv requires whitened data")
+
+        design = data.design
+        selected_mus = []
+        all_results = []
+
+        for i in range(2):
+            start = sum(design.stim_lens[:i])
+            stop = start + design.stim_lens[i]
+
+            single_design = replace(
+                design,
+                basis=[design.basis[i]],
+                tstart=[design.tstart[i]],
+                tstop=[design.tstop[i]],
+                stim_dims=[design.stim_dims[i]],
+                stim_names=[design.stim_names[i]],
+                stim_is_single=True,
+                stim_baseline=(
+                    None if design.stim_baseline is None
+                    else design.stim_baseline[start:stop].copy()
+                ),
+                stim_scaling=(
+                    None if design.stim_scaling is None
+                    else design.stim_scaling[start:stop].copy()
+                ),
+            )
+
+            single_data = replace(
+                data,
+                stim=[[segment[i]] for segment in data.stim],
+                design=single_design,
+            )
+
+            solver = replace(self, shared_mu=True, mu='auto')
+            selected, cv_results = solver.search(single_data, cv)
+
+            selected_mus.append(float(selected.mu))
+            all_results.append(cv_results)
+
+            print(f"\nPredictor {i + 1}: {design.stim_names[i]}")
+            print(f"Selected mu_{i + 1}: {selected.mu:.12e}")
+            print(f"CV candidates evaluated: {len(cv_results)}")
+
+            for result in sorted(cv_results, key=lambda r: r.solver.mu):
+                print(
+                    f"mu={result.solver.mu:.12e}, "
+                    f"cross_fit={result.scores['cross_fit']:.8f}"
+                )
+
+        mu_1_ind, mu_2_ind = selected_mus
+
+        print("\nIndependent CV results:")
+        print(f"mu_1_ind = {mu_1_ind:.12e}")
+        print(f"mu_2_ind = {mu_2_ind:.12e}")
+
+        return (mu_1_ind, mu_2_ind), tuple(all_results)
+
+    def local_grid_cv(
+            self,
+            data: RegressionData,
+            cv: CrossValidation,
+            mu_ind: tuple[float, float],
+            n: int = 5,
+            log_step: float = 1 / 6,
+    ) -> tuple[ChampLasso, list[CVResult]]:
+        if self.shared_mu:
+            raise ValueError("local_grid_cv requires shared_mu=False")
+
+        mu_g_ind, mu_c_ind = mu_ind
+        offsets = (np.arange(n) - (n - 1) / 2) * log_step
+
+        mus_g = mu_g_ind * 10.0 ** offsets
+        mus_c = mu_c_ind * 10.0 ** offsets
+
+        candidates = [
+            replace(self, mu=(float(g), float(c)), use_es=False)
+            for g in mus_g
+            for c in mus_c
+        ]
+
+        cv_results = crossvalidate(data, candidates, cv)
+        best = replace(self, use_es=False)._select(cv_results)
+
+        print(f"Independent mu: {mu_ind}")
+        print(f"Local grid: {n}x{n}")
+        print(f"Selected mu: {best.mu}")
+        print(f"Selected cross_fit: {min(r.scores['cross_fit'] for r in cv_results):.8f}")
+
+        return best, cv_results
 
     def auto_candidates_by_predictor(
             self,
